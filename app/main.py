@@ -122,6 +122,44 @@ def extract_citations(message: dict, content: str) -> list:
     return out
 
 
+def extract_citations_from_tool_calls(server_tool_calls: list) -> list:
+    """Streaming mode: sources ride inside delta.server_tool_calls[].calls[].sources[]
+    ({type: 'url', url, title, snippet}). Non-streaming uses annotations; both shapes
+    are normalized to the same client citation object."""
+    out: list = []
+    seen: set = set()
+    for stc in (server_tool_calls or []):
+        if not isinstance(stc, dict):
+            continue
+        for call in (stc.get("calls") or []):
+            if not isinstance(call, dict):
+                continue
+            for src in (call.get("sources") or []):
+                if not isinstance(src, dict) or src.get("type") != "url":
+                    continue
+                url = src.get("url")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                item = {"title": src.get("title") or url, "url": url}
+                snippet = src.get("snippet")
+                if snippet:
+                    item["cited_text"] = snippet
+                out.append(item)
+    return out
+
+
+def merge_citations(primary: list, fallback: list) -> list:
+    """Dedupe by URL; entries in `primary` (annotations) win over `fallback` (sources)."""
+    out: list = list(primary)
+    seen = {c.get("url") for c in primary if isinstance(c, dict)}
+    for c in fallback or []:
+        if isinstance(c, dict) and c.get("url") and c["url"] not in seen:
+            out.append(c)
+            seen.add(c["url"])
+    return out
+
+
 def extract_usage(usage: dict) -> dict:
     stu = usage.get("server_tool_use") or {}
     return {
@@ -261,9 +299,12 @@ async def search_answer(req: SearchRequest):
             "citations": [],
         })
 
-    citations = extract_citations(message, content)
+    citations = merge_citations(
+        extract_citations(message, content),
+        extract_citations_from_tool_calls(message.get("server_tool_calls")),
+    )
     usage = extract_usage(body.get("usage") or {})
-    tools_used = len(message.get("server_tool_calls") or [])
+    tools_used = sum(len(stc.get("calls") or []) for stc in (message.get("server_tool_calls") or []) if isinstance(stc, dict))
     if tools_used == 0:
         tools_used = (usage.get("search_calls") or 0) + (usage.get("fetch_calls") or 0) + (usage.get("image_search_calls") or 0)
 
@@ -292,6 +333,7 @@ async def search_answer_stream(req: SearchRequest):
         yield sse_event("start", {"model": MODEL, "depth": req.depth})
         content_parts: list = []
         annotations: list = []
+        tool_call_records: list = []
         usage: Optional[dict] = None
         refusal_text: Optional[str] = None
         finish_reason: Optional[str] = None
@@ -366,6 +408,9 @@ async def search_answer_stream(req: SearchRequest):
                     delta_ann = delta.get("annotations")
                     if delta_ann:
                         annotations.extend(delta_ann)
+                    stc = delta.get("server_tool_calls")
+                    if stc:
+                        tool_call_records.extend(stc if isinstance(stc, list) else [stc])
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
                     if chunk.get("usage"):
@@ -381,9 +426,16 @@ async def search_answer_stream(req: SearchRequest):
                                         "explanation": refusal_text or "The request was declined by the provider's safety review."})
         else:
             full_content = "".join(content_parts)
-            final_message = {"annotations": annotations}
-            yield sse_event("citations", {"citations": extract_citations(final_message, full_content)})
-            yield sse_event("usage", {"usage": extract_usage(usage or {})})
+            ann_cits = extract_citations({"annotations": annotations}, full_content)
+            src_cits = extract_citations_from_tool_calls(tool_call_records)
+            citations = merge_citations(ann_cits, src_cits)
+            yield sse_event("citations", {"citations": citations})
+            usage_out = extract_usage(usage or {})
+            tools_used = sum(len(stc.get("calls") or []) for stc in tool_call_records if isinstance(stc, dict))
+            if tools_used == 0:
+                tools_used = (usage_out.get("search_calls") or 0) + (usage_out.get("fetch_calls") or 0) + (usage_out.get("image_search_calls") or 0)
+            usage_out["tools_used"] = tools_used
+            yield sse_event("usage", {"usage": usage_out})
         yield sse_event("done", {"ok": finish_reason != "content_filter"})
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={
